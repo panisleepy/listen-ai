@@ -1,0 +1,49 @@
+services:
+  stat:
+    build:
+      context: ./stat
+    environment:
+      - STAT_PORT=8002
+      - SQLITE_PATH=/data/listenai.db
+      - NLP_URL=http://nlp:8001
+      - SENTIMENT_CACHE_VERSION=nlp-v1
+    volumes:
+      - listenai_data:/data
+    ports:
+      - "8002:8002"
+    depends_on:
+      - nlp
+
+  nlp:
+    build:
+      context: ./nlp
+    ports:
+      - "8001:8001"
+
+  gateway:
+    build:
+      context: ./gateway
+    environment:
+      - GATEWAY_PORT=8000
+      - STAT_URL=http://stat:8002
+      - NLP_URL=http://nlp:8001
+      - DEMO_USER=admin
+      - DEMO_PASS=admin123
+    depends_on:
+      - stat
+      - nlp
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      - GATEWAY_URL=http://gateway:8000
+    depends_on:
+      - gateway
+    ports:
+      - "8501:8501"
+
+volumes:
+  listenai_data:

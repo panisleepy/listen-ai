@@ -20,3 +20,9 @@ stat/stat-service
 
 # Env
 .env
+
+# Benchmark / scratch
+frontend/.benchmark_touch
+
+# NLP trained bundle (regenerate via train_sentiment_model.py)
+nlp/artifacts/*.joblib

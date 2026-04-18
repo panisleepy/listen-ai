@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -17,11 +19,14 @@ import (
 )
 
 type Post struct {
-	ID        int    `json:"id"`
-	Platform  string `json:"platform"`
-	Author    string `json:"author"`
-	Content   string `json:"content"`
-	CreatedAt string `json:"created_at"`
+	ID               int    `json:"id"`
+	Platform         string `json:"platform"`
+	Author           string `json:"author"`
+	Content          string `json:"content"`
+	CreatedAt        string `json:"created_at"`
+	Sentiment        string `json:"sentiment,omitempty"`
+	SentimentScore   int    `json:"sentiment_score"`
+	SentimentVersion string `json:"sentiment_version,omitempty"`
 }
 
 type StatsRequest struct {
@@ -239,7 +244,8 @@ func fetchFilteredPosts(db *sql.DB, req StatsRequest) ([]Post, error) {
 	}
 
 	rows, err := db.Query(
-		`SELECT id, platform, author, content, created_at
+		`SELECT id, platform, author, content, created_at,
+		        sentiment_label, sentiment_score, sentiment_version
 		 FROM posts
 		 WHERE date(created_at) BETWEEN date(?) AND date(?)
 		 ORDER BY datetime(created_at) DESC`,
@@ -254,8 +260,29 @@ func fetchFilteredPosts(db *sql.DB, req StatsRequest) ([]Post, error) {
 	posts := []Post{}
 	for rows.Next() {
 		var p Post
-		if err := rows.Scan(&p.ID, &p.Platform, &p.Author, &p.Content, &p.CreatedAt); err != nil {
+		var sentLabel sql.NullString
+		var sentScore sql.NullInt64
+		var sentVer sql.NullString
+		if err := rows.Scan(
+			&p.ID,
+			&p.Platform,
+			&p.Author,
+			&p.Content,
+			&p.CreatedAt,
+			&sentLabel,
+			&sentScore,
+			&sentVer,
+		); err != nil {
 			return nil, err
+		}
+		if sentLabel.Valid && strings.TrimSpace(sentLabel.String) != "" {
+			p.Sentiment = sentLabel.String
+		}
+		if sentScore.Valid {
+			p.SentimentScore = int(sentScore.Int64)
+		}
+		if sentVer.Valid {
+			p.SentimentVersion = sentVer.String
 		}
 
 		if !containsAny(p.Content, req.IncludeKeywords) {
@@ -278,7 +305,7 @@ func fetchFilteredPosts(db *sql.DB, req StatsRequest) ([]Post, error) {
 }
 
 func setupDatabase(db *sql.DB) error {
-	_, err := db.Exec(`
+	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS posts (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			platform TEXT NOT NULL,
@@ -286,8 +313,77 @@ func setupDatabase(db *sql.DB) error {
 			content TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		)
-	`)
-	return err
+	`); err != nil {
+		return err
+	}
+	return migrateSentimentColumns(db)
+}
+
+func migrateSentimentColumns(db *sql.DB) error {
+	stmts := []string{
+		`ALTER TABLE posts ADD COLUMN sentiment_label TEXT`,
+		`ALTER TABLE posts ADD COLUMN sentiment_score INTEGER`,
+		`ALTER TABLE posts ADD COLUMN sentiment_version TEXT`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "duplicate column") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+type nlpSentimentRequest struct {
+	Texts []string `json:"texts"`
+}
+
+type nlpClassification struct {
+	Label string `json:"label"`
+	Score int    `json:"score"`
+}
+
+type nlpSentimentResponse struct {
+	Classifications []nlpClassification `json:"classifications"`
+}
+
+func fetchSentimentFromNLP(nlpURL, text string) (label string, score int, err error) {
+	payload := nlpSentimentRequest{Texts: []string{text}}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", 0, err
+	}
+	endpoint := strings.TrimRight(nlpURL, "/") + "/sentiment"
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", 0, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", 0, fmt.Errorf("nlp status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var parsed nlpSentimentResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", 0, err
+	}
+	if len(parsed.Classifications) == 0 {
+		return "neutral", 0, nil
+	}
+	c := parsed.Classifications[0]
+	return c.Label, c.Score, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
@@ -317,6 +413,7 @@ func main() {
 	if sqlitePath == "" {
 		sqlitePath = "./listenai.db"
 	}
+	nlpURL := strings.TrimSpace(os.Getenv("NLP_URL"))
 
 	db, err := sql.Open("sqlite", sqlitePath)
 	if err != nil {
@@ -419,7 +516,29 @@ func main() {
 			return
 		}
 
-		writeJSON(w, http.StatusCreated, InsertPostResponse{ID: int(id64)})
+		postID := int(id64)
+		if nlpURL != "" {
+			label, score, err := fetchSentimentFromNLP(nlpURL, req.Content)
+			if err != nil {
+				log.Printf("sentiment enrich failed post_id=%d: %v", postID, err)
+			} else {
+				version := strings.TrimSpace(os.Getenv("SENTIMENT_CACHE_VERSION"))
+				if version == "" {
+					version = "nlp-v1"
+				}
+				if _, err := db.Exec(
+					`UPDATE posts SET sentiment_label = ?, sentiment_score = ?, sentiment_version = ? WHERE id = ?`,
+					label,
+					score,
+					version,
+					postID,
+				); err != nil {
+					log.Printf("sentiment persist failed post_id=%d: %v", postID, err)
+				}
+			}
+		}
+
+		writeJSON(w, http.StatusCreated, InsertPostResponse{ID: postID})
 	})
 
 	addr := ":" + port

@@ -30,7 +30,11 @@ go mod tidy
 ```bash
 export STAT_PORT=8002
 export SQLITE_PATH=./listenai.db
+export NLP_URL=http://localhost:8001
+export SENTIMENT_CACHE_VERSION=nlp-v1
 ```
+
+When `NLP_URL` is set, `POST /posts` enriches each new row by calling the NLP `/sentiment` endpoint once and storing `sentiment_label`, `sentiment_score`, and `sentiment_version` in SQLite (see `main.go`).
 
 4. Start the service:
 

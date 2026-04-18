@@ -1,11 +1,61 @@
 import os
 import re
 from collections import Counter
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 app = FastAPI(title="listen-ai-nlp")
+
+_SENTIMENT_BACKEND = os.getenv("SENTIMENT_BACKEND", "auto").lower()
+_MODEL_PATH = Path(os.getenv("SENTIMENT_MODEL_PATH", "")).expanduser()
+if str(_MODEL_PATH) == "." or str(_MODEL_PATH) == "":
+    _MODEL_PATH = Path(__file__).resolve().parent / "artifacts" / "sentiment_model.joblib"
+
+_ML_BUNDLE: dict[str, Any] | None = None
+
+
+def _load_ml_bundle() -> dict[str, Any] | None:
+    global _ML_BUNDLE
+    if _ML_BUNDLE is not None:
+        return _ML_BUNDLE
+    if _SENTIMENT_BACKEND == "lexicon":
+        return None
+    if _SENTIMENT_BACKEND not in {"auto", "ml"}:
+        return None
+    if not _MODEL_PATH.exists():
+        return None
+    try:
+        import joblib
+    except ImportError:
+        return None
+    try:
+        _ML_BUNDLE = joblib.load(_MODEL_PATH)
+    except Exception:
+        _ML_BUNDLE = None
+        return None
+    required = {"vectorizer", "classifier", "label_encoder"}
+    if not required.issubset(_ML_BUNDLE.keys()):
+        _ML_BUNDLE = None
+        return None
+    return _ML_BUNDLE
+
+
+def classify_ml(text: str) -> tuple[str, int]:
+    bundle = _load_ml_bundle()
+    if bundle is None:
+        return classify_text(text)
+    vectorizer = bundle["vectorizer"]
+    classifier = bundle["classifier"]
+    label_encoder = bundle["label_encoder"]
+    matrix = vectorizer.transform([text])
+    proba = classifier.predict_proba(matrix)[0]
+    best_idx = max(range(len(proba)), key=lambda i: proba[i])
+    label = str(label_encoder.inverse_transform([best_idx])[0])
+    score = int(round(float(proba[best_idx]) * 100))
+    return label, score
 
 POSITIVE_WORDS = {
     "good",
@@ -172,16 +222,24 @@ class SentimentResponse(BaseModel):
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": "nlp", "port": os.getenv("NLP_PORT", "8001")}
+    bundle = _load_ml_bundle()
+    mode = "ml" if bundle is not None else "lexicon"
+    return {
+        "status": "ok",
+        "service": "nlp",
+        "port": os.getenv("NLP_PORT", "8001"),
+        "sentiment": mode,
+    }
 
 
 @app.post("/sentiment", response_model=SentimentResponse)
 def sentiment(req: SentimentRequest) -> SentimentResponse:
     results: list[SentimentItem] = []
     counts = Counter({"positive": 0, "neutral": 0, "negative": 0})
+    use_ml = _SENTIMENT_BACKEND == "ml" or (_SENTIMENT_BACKEND == "auto" and _load_ml_bundle() is not None)
 
     for text in req.texts:
-        label, score = classify_text(text)
+        label, score = classify_ml(text) if use_ml else classify_text(text)
         counts[label] += 1
         results.append(SentimentItem(text=text, label=label, score=score))
 
